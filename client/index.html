@@ -1,0 +1,362 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Gemini Live Test</title>
+</head>
+<body>
+  <h2>Gemini Live Receptionist</h2>
+
+  <p id="status">Checking backend...</p>
+
+  <button id="start">Start call</button>
+  <button id="end" disabled>End call and save</button>
+
+  <h3>Transcript</h3>
+  <pre id="transcript"></pre>
+
+  <h3>Debug</h3>
+  <pre id="debug"></pre>
+
+  <script>
+    const API_URL =
+  location.hostname === "localhost" || location.hostname === "127.0.0.1"
+    ? "http://localhost:3000"
+    : "https://YOUR-BACKEND.onrender.com";
+
+const WS_URL = API_URL.replace(/^http/, "ws") + "/gemini";
+
+    const statusEl = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
+    const debugEl = document.getElementById("debug");
+
+    let socket;
+    let audioContext;
+    let micStream;
+    let micSource;
+    let processor;
+    let silentGain;
+
+    let ready = false;
+    let active = false;
+    let saving = false;
+
+    let transcript = [];
+    let startedAt;
+    let nextPlayTime = 0;
+
+    function log(message) {
+      console.log(message);
+      debugEl.textContent += message + "\n";
+    }
+
+    function addTranscript(speaker, text) {
+      if (!text || !text.trim()) return;
+
+      transcript.push({ speaker, text: text.trim() });
+
+      transcriptEl.textContent = transcript
+        .map(item => item.speaker + ": " + item.text)
+        .join("\n\n");
+    }
+
+    function base64ToBuffer(base64) {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+
+      return bytes.buffer;
+    }
+
+    function bufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = "";
+
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+
+      return btoa(binary);
+    }
+
+    function convertToPcm16(input) {
+      const output = new Int16Array(input.length);
+
+      for (let i = 0; i < input.length; i++) {
+        const sample = Math.max(-1, Math.min(1, input[i]));
+        output[i] = sample < 0
+          ? sample * 32768
+          : sample * 32767;
+      }
+
+      return output;
+    }
+
+    function downsample(input, inputRate) {
+      const targetRate = 16000;
+
+      if (inputRate === targetRate) return input;
+
+      const ratio = inputRate / targetRate;
+      const output = new Float32Array(
+        Math.floor(input.length / ratio)
+      );
+
+      for (let i = 0; i < output.length; i++) {
+        const start = Math.floor(i * ratio);
+        const end = Math.min(
+          Math.floor((i + 1) * ratio),
+          input.length
+        );
+
+        let sum = 0;
+        let count = 0;
+
+        for (let j = start; j < end; j++) {
+          sum += input[j];
+          count++;
+        }
+
+        output[i] = count ? sum / count : 0;
+      }
+
+      return output;
+    }
+
+    function send(data) {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(data));
+      }
+    }
+
+    async function startMicrophone() {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: true
+      });
+
+      audioContext = new AudioContext();
+      await audioContext.resume();
+
+      micSource = audioContext.createMediaStreamSource(micStream);
+      processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+      silentGain = audioContext.createGain();
+      silentGain.gain.value = 0;
+
+      processor.onaudioprocess = event => {
+        if (!active || !ready) return;
+
+        const input = event.inputBuffer.getChannelData(0);
+        const sampled = downsample(input, audioContext.sampleRate);
+        const pcm = convertToPcm16(sampled);
+
+        send({
+          realtimeInput: {
+            audio: {
+              mimeType: "audio/pcm;rate=16000",
+              data: bufferToBase64(pcm.buffer)
+            }
+          }
+        });
+      };
+
+      micSource.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(audioContext.destination);
+
+      log("Microphone started");
+    }
+
+    async function playAudio(base64) {
+      const pcm = new Int16Array(base64ToBuffer(base64));
+
+      const audioBuffer = audioContext.createBuffer(
+        1,
+        pcm.length,
+        24000
+      );
+
+      const channel = audioBuffer.getChannelData(0);
+
+      for (let i = 0; i < pcm.length; i++) {
+        channel[i] = pcm[i] / 32768;
+      }
+
+      const source = audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioContext.destination);
+
+      const when = Math.max(audioContext.currentTime, nextPlayTime);
+      source.start(when);
+      nextPlayTime = when + audioBuffer.duration;
+    }
+
+    async function handleMessage(event) {
+      const message = JSON.parse(event.data);
+
+      if (message.proxyStatus === "gemini_closed") {
+        log("Gemini closed: " + message.code + " " + message.reason);
+        statusEl.textContent = "Gemini connection closed";
+        return;
+      }
+
+      if (message.error) {
+        log("Gemini error: " + JSON.stringify(message.error));
+      }
+
+      if (message.setupComplete) {
+        log("Gemini setup completed!");
+        ready = true;
+
+        await startMicrophone();
+
+        statusEl.textContent = "Live. Speak now.";
+        document.getElementById("start").disabled = true;
+        document.getElementById("end").disabled = false;
+
+        send({
+          clientContent: {
+            turns: [{
+              role: "user",
+              parts: [{
+                text: "Greet the caller and ask how you can help them today."
+              }]
+            }],
+            turnComplete: true
+          }
+        });
+
+        return;
+      }
+
+      const content = message.serverContent;
+      if (!content) return;
+
+      if (content.inputTranscription?.text) {
+        addTranscript("You", content.inputTranscription.text);
+      }
+
+      if (content.outputTranscription?.text) {
+        addTranscript("Gemini", content.outputTranscription.text);
+      }
+
+      const parts = content.modelTurn?.parts || [];
+
+      for (const part of parts) {
+        const audio = part.inlineData || part.inline_data;
+
+        if (audio?.data && audio.mimeType?.startsWith("audio/pcm")) {
+          await playAudio(audio.data);
+        } else if (
+          audio?.data &&
+          audio.mime_type?.startsWith("audio/pcm")
+        ) {
+          await playAudio(audio.data);
+        }
+      }
+    }
+
+    document.getElementById("start").onclick = () => {
+      transcript = [];
+      transcriptEl.textContent = "";
+      debugEl.textContent = "";
+      startedAt = new Date().toISOString();
+
+      active = true;
+      ready = false;
+
+      statusEl.textContent = "Connecting to backend...";
+      log("Opening backend WebSocket...");
+
+      socket = new WebSocket(WS_URL);
+
+      socket.onopen = () => {
+        log("Backend connected. Waiting for Gemini setup...");
+      };
+
+      socket.onmessage = event => {
+        handleMessage(event).catch(error => {
+          log("Message handling error: " + error.message);
+        });
+      };
+
+      socket.onerror = () => {
+        log("Browser WebSocket error. Check server terminal.");
+      };
+
+      socket.onclose = event => {
+        log("Socket closed: " + event.code + " " + event.reason);
+      };
+    };
+
+    document.getElementById("end").onclick = async () => {
+      if (saving) return;
+      saving = true;
+      active = false;
+      ready = false;
+
+      if (processor) processor.disconnect();
+      if (micSource) micSource.disconnect();
+      if (silentGain) silentGain.disconnect();
+
+      if (micStream) {
+        micStream.getTracks().forEach(track => track.stop());
+      }
+
+      if (audioContext) await audioContext.close();
+
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
+
+      statusEl.textContent = "Saving transcript...";
+
+      if (transcript.length === 0) {
+        statusEl.textContent = "No transcript to save";
+        saving = false;
+        return;
+      }
+
+      const response = await fetch(API_URL + "/api/calls", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          transcript,
+          startedAt,
+          endedAt: new Date().toISOString()
+        })
+      });
+
+      const result = await response.json();
+
+      if (response.ok) {
+        statusEl.textContent = "Saved to MongoDB. ID: " + result.id;
+        log("MongoDB save successful");
+      } else {
+        statusEl.textContent = "Save failed: " + result.error;
+        log("MongoDB save failed: " + result.error);
+      }
+
+      document.getElementById("start").disabled = false;
+      document.getElementById("end").disabled = true;
+      saving = false;
+    };
+
+    fetch(API_URL + "/api/health")
+      .then(response => response.json())
+      .then(data => {
+        statusEl.textContent =
+          "Backend running. Model: " + data.model +
+          ". MongoDB: " + data.mongodb;
+      })
+      .catch(error => {
+        statusEl.textContent = "Backend is not running";
+        log(error.message);
+      });
+  </script>
+</body>
+</html>

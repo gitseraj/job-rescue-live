@@ -1,0 +1,308 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Call Dashboard</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: white;
+      color: black;
+      margin: 0;
+      padding: 24px;
+    }
+
+    main {
+      max-width: 1200px;
+      margin: auto;
+    }
+
+    button {
+      background: white;
+      color: black;
+      border: 1px solid black;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #eee;
+    }
+
+    .top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 20px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 900px;
+    }
+
+    th, td {
+      border: 1px solid #ccc;
+      text-align: left;
+      padding: 12px;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f2f2f2;
+    }
+
+    .summary {
+      max-width: 250px;
+      line-height: 1.4;
+    }
+
+    .urgency-high {
+      font-weight: bold;
+      text-decoration: underline;
+    }
+
+    #transcriptPanel {
+      border: 1px solid black;
+      padding: 16px;
+      margin-top: 24px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.6;
+    }
+
+    .hidden {
+      display: none;
+    }
+
+    .muted {
+      color: #555;
+    }
+
+    .transcript-line {
+      padding: 10px 0;
+      border-bottom: 1px solid #ddd;
+    }
+
+    input {
+      padding: 9px;
+      border: 1px solid #aaa;
+      width: min(320px, 90%);
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <div class="top">
+      <div>
+        <h1>Call Dashboard</h1>
+        <p class="muted">AI receptionist call history</p>
+      </div>
+
+      <div>
+        <button id="refreshBtn">Refresh calls</button>
+        <button onclick="location.href='index.html'">Test receptionist</button>
+      </div>
+    </div>
+
+    <p id="status">Loading calls...</p>
+
+    <input
+      id="search"
+      type="search"
+      placeholder="Search name, problem, location..."
+    >
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Call time</th>
+            <th>Name</th>
+            <th>Location</th>
+            <th>Problem</th>
+            <th>Preferred timing</th>
+            <th>Urgency</th>
+            <th>Summary</th>
+            <th>Transcript</th>
+          </tr>
+        </thead>
+        <tbody id="callsBody"></tbody>
+      </table>
+    </div>
+
+    <section id="transcriptPanel" class="hidden">
+      <div class="top">
+        <h2 id="transcriptTitle">Call transcript</h2>
+        <button id="closeTranscript">Close transcript</button>
+      </div>
+
+      <div id="transcriptContent"></div>
+    </section>
+  </main>
+
+  <script>
+    const API_URL =
+  location.hostname === "localhost" || location.hostname === "127.0.0.1"
+    ? "http://localhost:3000"
+    : "https://YOUR-BACKEND.onrender.com";
+
+    const statusEl = document.getElementById("status");
+    const callsBody = document.getElementById("callsBody");
+    const searchEl = document.getElementById("search");
+    const transcriptPanel = document.getElementById("transcriptPanel");
+    const transcriptTitle = document.getElementById("transcriptTitle");
+    const transcriptContent = document.getElementById("transcriptContent");
+
+    let allCalls = [];
+
+    function createCell(text, className = "") {
+      const td = document.createElement("td");
+      td.textContent = text || "Not provided";
+
+      if (className) td.className = className;
+
+      return td;
+    }
+
+    function formatDate(value) {
+      if (!value) return "Unknown";
+
+      const date = new Date(value);
+
+      if (Number.isNaN(date.getTime())) return "Unknown";
+
+      return date.toLocaleString();
+    }
+
+    function showTranscript(call) {
+      transcriptTitle.textContent =
+        "Transcript: " + (call.callerName || "Unknown caller");
+
+      transcriptContent.replaceChildren();
+
+      if (!call.transcript || call.transcript.length === 0) {
+        transcriptContent.textContent = "No transcript available.";
+      } else {
+        call.transcript.forEach(item => {
+          const line = document.createElement("div");
+          line.className = "transcript-line";
+
+          const speaker = document.createElement("strong");
+          speaker.textContent = (item.speaker || "Unknown") + ": ";
+
+          const text = document.createElement("span");
+          text.textContent = item.text || "";
+
+          line.append(speaker, text);
+          transcriptContent.appendChild(line);
+        });
+      }
+
+      transcriptPanel.classList.remove("hidden");
+      transcriptPanel.scrollIntoView({ behavior: "smooth" });
+    }
+
+    function renderCalls() {
+      const query = searchEl.value.trim().toLowerCase();
+      callsBody.replaceChildren();
+
+      const filteredCalls = allCalls.filter(call => {
+        const searchable = [
+          call.callerName,
+          call.location,
+          call.problem,
+          call.timing,
+          call.urgency,
+          call.summary
+        ].join(" ").toLowerCase();
+
+        return searchable.includes(query);
+      });
+
+      if (filteredCalls.length === 0) {
+        const row = document.createElement("tr");
+        const cell = createCell("No calls found.");
+        cell.colSpan = 8;
+        row.appendChild(cell);
+        callsBody.appendChild(row);
+        return;
+      }
+
+      filteredCalls.forEach(call => {
+        const row = document.createElement("tr");
+
+        row.appendChild(createCell(formatDate(call.createdAt)));
+        row.appendChild(createCell(call.callerName));
+        row.appendChild(createCell(call.location));
+        row.appendChild(createCell(call.problem));
+        row.appendChild(createCell(call.timing));
+
+        const urgencyCell = createCell(call.urgency);
+        if (call.urgency === "High") {
+          urgencyCell.className = "urgency-high";
+        }
+        row.appendChild(urgencyCell);
+
+        row.appendChild(createCell(call.summary, "summary"));
+
+        const transcriptCell = document.createElement("td");
+        const viewButton = document.createElement("button");
+
+        viewButton.textContent = "View transcript";
+        viewButton.addEventListener("click", () => showTranscript(call));
+
+        transcriptCell.appendChild(viewButton);
+        row.appendChild(transcriptCell);
+
+        callsBody.appendChild(row);
+      });
+
+      statusEl.textContent =
+        filteredCalls.length + " call(s) shown";
+    }
+
+    async function loadCalls() {
+      statusEl.textContent = "Loading calls...";
+
+      try {
+        const response = await fetch(API_URL + "/api/calls");
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || "Could not load calls");
+        }
+
+        allCalls = data;
+        renderCalls();
+      } catch (error) {
+        statusEl.textContent =
+          "Could not load calls: " + error.message;
+      }
+    }
+
+    document.getElementById("refreshBtn")
+      .addEventListener("click", loadCalls);
+
+    document.getElementById("closeTranscript")
+      .addEventListener("click", () => {
+        transcriptPanel.classList.add("hidden");
+      });
+
+    searchEl.addEventListener("input", renderCalls);
+
+    loadCalls();
+  </script>
+</body>
+</html>
